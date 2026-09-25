@@ -1,0 +1,166 @@
+const TelegramBot = require('node-telegram-bot-api');
+const sqlite3 = require('sqlite3').verbose();
+
+// 填入您的机器人 Token 和主持人 ID
+const TOKEN = "8990552549:AAHPx1JozcxrEtgyEDzx881w2FQBuhwc9p4";
+const HOST_USER_ID = 8267239773;
+
+// 使用长轮询 (Polling)，在 Render 上最稳定，不需要配置复杂的 Webhook 域名和 404
+const bot = new TelegramBot(TOKEN, { polling: true });
+
+// 初始化 SQLite 数据库（存储在本地文件 database.sqlite）
+const db = new sqlite3.Database('./database.sqlite', (err) => {
+  if (err) console.error('Database opening error: ', err);
+});
+
+db.serialize(() => {
+  db.run(`CREATE TABLE IF NOT EXISTS active_quiz (
+    channel_id TEXT,
+    message_id INTEGER,
+    q_index INTEGER,
+    correct_answer TEXT
+  )`);
+  db.run(`CREATE TABLE IF NOT EXISTS winners (
+    channel_id TEXT,
+    message_id INTEGER,
+    user_id INTEGER,
+    user_name TEXT,
+    created_at INTEGER
+  )`);
+});
+
+const QUESTIONS = [
+  { q: "1. 中秋节通常在农历几月十五？", options: ["一月", "八月", "十月", "十二月"], answer: "B" },
+  { q: "2. 中秋节最常见的传统食品是什么？", options: ["粽子", "年糕", "月饼", "汤圆"], answer: "C" },
+  { q: "3. 中秋节与哪个天体关系最密切？", options: ["月亮", "太阳", "火星", "北极星"], answer: "A" },
+  { q: "4. “嫦娥奔月”中的嫦娥与谁有关？", options: ["后羿", "哪吒", "孙悟空", "牛郎"], answer: "A" },
+  { q: "5. 中秋节又常被称为什么节？", options: ["端午节", "元宵节", "团圆节", "清明节"], answer: "C" }
+  // （您可以按需继续添加剩下的题目）
+];
+
+// 监听 /startgame 指令 (仅限主持人)
+bot.onText(/\/startgame/, (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+
+  if (userId !== HOST_USER_ID) {
+    bot.sendMessage(chatId, "⚠️ **权限不足**：只有晚会主持人才能执行此命令。");
+    return;
+  }
+
+  const opts = {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "📢 中秋主频道 (@jie666789)", callback_data: "set_channel_@jie666789" }]
+      ]
+    }
+  };
+  bot.sendMessage(chatId, "🎛️ **中秋晚会主持人面板**\n\n请选择要发布题目的目标频道：", opts);
+});
+
+// 监听按钮点击事件
+bot.on('callback_query', async (callbackQuery) => {
+  const msg = callbackQuery.message;
+  const data = callbackQuery.data;
+  const userId = callbackQuery.from.id;
+  const chatId = msg.chat.id;
+  const messageId = msg.message_id;
+
+  if (userId !== HOST_USER_ID) {
+    bot.answerCallbackQuery(callbackQuery.id, { text: "⚠️ 只有主持人才能操作！", show_alert: true });
+    return;
+  }
+
+  bot.answerCallbackQuery(callbackQuery.id);
+
+  if (data.startsWith("set_channel_")) {
+    const channelId = data.replace("set_channel_", "");
+    let keyboardRows = [];
+    let currentRow = [];
+
+    QUESTIONS.forEach((q, i) => {
+      currentRow.push({ text: `${i + 1}`, callback_data: `q_${i}_${channelId}` });
+      if (currentRow.length === 5 || i === QUESTIONS.length - 1) {
+        keyboardRows.push(currentRow);
+        currentRow = [];
+      }
+    });
+
+    bot.editMessageText(`🎯 已绑定频道: \`${channelId}\`\n\n请点击下方按钮选择要发送的**第几题**：`, {
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: { inline_keyboard: keyboardRows }
+    });
+  } else if (data.startsWith("q_")) {
+    const parts = data.split("_");
+    const qIndex = parseInt(parts[1]);
+    const channelId = parts[2];
+    const qData = QUESTIONS[qIndex];
+
+    const text = `🌕 **中秋趣味问答 - 第 ${qIndex + 1} 题**\n\n` +
+                 `${qData.q}\n\n` +
+                 `A. ${qData.options[0]}\n` +
+                 `B. ${qData.options[1]}\n` +
+                 `C. ${qData.options[2]}\n` +
+                 `D. ${qData.options[3]}\n\n` +
+                 `💡 *请直接在本条消息的评论区回复你的答案字母（如 A、B、C 或 D）！*`;
+
+    try {
+      const sentMsg = await bot.sendMessage(channelId, text);
+      db.run("INSERT INTO active_quiz (channel_id, message_id, q_index, correct_answer) VALUES (?, ?, ?, ?)",
+        [channelId, sentMsg.message_id, qIndex, qData.answer]);
+
+      bot.editMessageText(`✅ **第 ${qIndex + 1} 题已成功发送到频道！**`, {
+        chat_id: chatId,
+        message_id: messageId
+      });
+    } catch (err) {
+      bot.editMessageText(`❌ 发送失败！请确保机器人已经是该频道（@jie666789）的**管理员**。`, {
+        chat_id: chatId,
+        message_id: messageId
+      });
+    }
+  }
+});
+
+// 监听观众在频道评论区的答题
+bot.on('message', (msg) => {
+  if (!msg.reply_to_message) return;
+  const channelId = msg.chat.id;
+  const replyMessageId = msg.reply_to_message.message_id;
+  const userText = (msg.text || "").trim().toUpperCase();
+
+  if (!["A", "B", "C", "D"].includes(userText)) return;
+
+  db.get("SELECT * FROM active_quiz WHERE channel_id = ? AND message_id = ?", [channelId.toString(), replyMessageId], (err, activeQuiz) => {
+    if (err || !activeQuiz) return;
+
+    if (userText === activeQuiz.correct_answer) {
+      const userId = msg.from.id;
+      const userName = msg.from.first_name || "热心观众";
+
+      db.get("SELECT * FROM winners WHERE channel_id = ? AND message_id = ? AND user_id = ?", 
+        [channelId.toString(), replyMessageId, userId], (err, existing) => {
+        if (!existing) {
+          db.run("INSERT INTO winners (channel_id, message_id, user_id, user_name, created_at) VALUES (?, ?, ?, ?, ?)",
+            [channelId.toString(), replyMessageId, userId, userName, Date.now()]);
+
+          db.all("SELECT user_name FROM winners WHERE channel_id = ? AND message_id = ? ORDER BY created_at ASC LIMIT 3",
+            [channelId.toString(), replyMessageId], (err, rows) => {
+            if (rows && rows.length <= 3) {
+              let announcement = `🏆 **【第 ${activeQuiz.q_index + 1} 题捷报】**\n\n已有前 ${rows.length} 名观众答对！\n`;
+              rows.forEach((w, index) => {
+                announcement += `第 ${index + 1} 名: ${w.user_name}\n`;
+              });
+              if (rows.length === 3) announcement += `\n🎉 本题前三名已全部产生！`;
+
+              bot.sendMessage(channelId, announcement, { reply_to_message_id: replyMessageId });
+            }
+          });
+        }
+      });
+    }
+  });
+});
+
+console.log("Mid-Autumn Quiz Bot is running on Render (Polling mode)...");
